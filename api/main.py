@@ -6,7 +6,7 @@ import os
 
 app = FastAPI()
 
-# 1. Update the Schema to match your 7 new features
+# 1. Updated Schema to include registration flag
 class LoginRequest(BaseModel):
     attempts_per_min: int
     fail_ratio: float
@@ -15,6 +15,7 @@ class LoginRequest(BaseModel):
     geo_anomaly: int
     honeypot: int
     typing_speed: float
+    is_registration: bool  # Set True for signup, False for login
 
 # Load the model
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,36 +24,43 @@ model = joblib.load(MODEL_PATH)
 
 @app.post("/v1/score")
 async def get_risk_score(request: LoginRequest):
-    # --- 1. DETERMINISTIC HARD RULES (Zero Tolerance) ---
+    # --- 1. REGISTRATION BASELINE LOGIC ---
+    # During registration, the current device IS the home device.
+    # We force device_change to 0 so the ML doesn't penalize a new user.
+    effective_device_change = 0 if request.is_registration else request.device_change
     
-    # Honeypot check (Highest Priority)
+    status_msg = "Baseline established during registration." if request.is_registration else "Standard login analysis."
+
+    # --- 2. DETERMINISTIC HARD RULES (Zero Tolerance) ---
+    
+    # Honeypot check: Bots clicking hidden fields are blocked regardless of phase.
     if request.honeypot == 1:
         return {
             "risk_score": 1.0, "action": "BLOCK", "is_anomaly": True,
-            "reason": "Honeypot Triggered: Automated Bot Detected"
+            "reason": f"Honeypot Triggered. {status_msg}"
         }
 
-    # Inhuman Speed Check: If login takes less than 0.8 seconds, it's a bot.
-    # No human can load, type, and click that fast.
+    # Inhuman Speed Check: Instant block if registration/login is too fast for a human.
     if request.typing_speed < 0.8:
         return {
             "risk_score": 1.0, "action": "BLOCK", "is_anomaly": True,
-            "reason": "Inhuman interaction speed detected"
+            "reason": f"Inhuman interaction speed. {status_msg}"
         }
 
-    # High Velocity Check: If they are trying 50+ times a minute.
+    # High Velocity Check
     if request.attempts_per_min > 50:
          return {
             "risk_score": 0.95, "action": "BLOCK", "is_anomaly": True,
-            "reason": "High-frequency attack pattern"
+            "reason": "High-frequency attack pattern detected."
         }
 
-    # --- 2. BEHAVIORAL ANALYSIS (ML Path) ---
+    # --- 3. BEHAVIORAL ANALYSIS (ML Path) ---
+    # We use 'effective_device_change' so the model sees '0' for all registrations.
     features = np.array([[
         request.attempts_per_min, 
         request.fail_ratio, 
         request.unique_accounts, 
-        request.device_change, 
+        effective_device_change, 
         request.geo_anomaly, 
         request.honeypot, 
         request.typing_speed
@@ -60,24 +68,35 @@ async def get_risk_score(request: LoginRequest):
     
     raw_anomaly_score = model.decision_function(features)[0]
     
-    # TUNING: Change 12 to 15 or 18 to make the model MORE SENSITIVE.
-    # Higher number = steeper risk curve for minor anomalies.
+    # Sigmoid normalization with stiffness 15
     risk_score = 1 / (1 + np.exp(raw_anomaly_score * 15)) 
     
-    # --- 3. DYNAMIC RESPONSE LOGIC ---
-    # More aggressive thresholds for a Hackathon environment
+    # --- 4. CONTEXTUAL OVERRIDE (Safety Net) ---
+    # If it's a login on a new device but typing is perfectly human and no fails:
+    # downgrade BLOCK to MFA to reduce False Positives.
+    is_human = request.typing_speed > 2.5 and request.fail_ratio == 0
+    if not request.is_registration and request.device_change == 1 and is_human:
+        risk_score = min(risk_score, 0.45)
+        status_msg = "New device detected with human behavior. Escalating to MFA."
+
+    # --- 5. DYNAMIC RESPONSE LOGIC ---
     action = "ALLOW"
-    if risk_score > 0.65: # Lowered from 0.7 to be more strict
+    if risk_score > 0.65:
         action = "BLOCK"
-    elif risk_score > 0.30: # Lowered from 0.35 to trigger MFA earlier
+    elif risk_score > 0.30:
         action = "MFA"
         
     return {
         "risk_score": round(float(risk_score), 3),
         "action": action,
         "is_anomaly": bool(risk_score > 0.5),
+        "reason": status_msg,
         "telemetry": {
-            "speed_check": "Inhuman" if request.typing_speed < 1.5 else "Human-like",
-            "score_stiffness": 15
+            "mode": "Registration" if request.is_registration else "Login",
+            "device_status": "Trusted/Home" if effective_device_change == 0 else "Unrecognized"
         }
     }
+
+@app.get("/")
+async def health():
+    return {"status": "Beyond Limits ML Engine Online", "active_model": "Isolation Forest v1.8"}
